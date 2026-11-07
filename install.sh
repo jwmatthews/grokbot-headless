@@ -7,9 +7,9 @@ lib_dir="${HOME}/.local/lib/grok-bot-headless"
 unit_dir="${HOME}/.config/systemd/user"
 config_dir="${HOME}/.config/grok-bot-headless"
 environment_path="${config_dir}/environment"
-app_bin="${GROK_BOT_BINARY:-/opt/Grok Bot/grok-bot}"
-daemon_script="${GROK_BOT_DAEMON_SCRIPT:-/opt/Grok Bot/resources/app.asar/dist/local-exec-daemon/main.cjs}"
-if [[ "$app_bin" == *$'\n'* || "$app_bin" == *$'\r'* || "$daemon_script" == *$'\n'* || "$daemon_script" == *$'\r'* ]]; then
+app_asar="${GROK_BOT_APP_ASAR:-/opt/Grok Bot/resources/app.asar}"
+daemon_script="${GROK_BOT_DAEMON_SCRIPT:-}"
+if [[ "$app_asar" == *$'\n'* || "$app_asar" == *$'\r'* || "$daemon_script" == *$'\n'* || "$daemon_script" == *$'\r'* ]]; then
   printf 'Error: application paths cannot contain line breaks.\n' >&2
   exit 1
 fi
@@ -23,10 +23,16 @@ if (( node_major < 20 )); then
   printf 'Error: Node.js 20 or newer is required; found %s.\n' "$(node --version)" >&2
   exit 1
 fi
+# The systemd user manager has a short PATH, so the service needs the absolute Node path.
+node_bin="$(node -p 'process.execPath')"
+if [[ "$node_bin" == *$'\n'* || "$node_bin" == *$'\r'* ]]; then
+  printf 'Error: the Node.js path cannot contain line breaks.\n' >&2
+  exit 1
+fi
 printf 'Checking Grok Bot compatibility...\n'
-if ! GROK_BOT_BINARY="$app_bin" GROK_BOT_DAEMON_SCRIPT="$daemon_script" \
+if ! GROK_BOT_APP_ASAR="$app_asar" GROK_BOT_DAEMON_SCRIPT="$daemon_script" \
   node "$repo_dir/grok-bot-headless.mjs" check --local; then
-  printf 'Install Grok Bot first, or set GROK_BOT_BINARY and GROK_BOT_DAEMON_SCRIPT.\n' >&2
+  printf 'Install Grok Bot first, or set GROK_BOT_APP_ASAR or GROK_BOT_DAEMON_SCRIPT.\n' >&2
   exit 1
 fi
 
@@ -35,12 +41,17 @@ chmod 0700 "$config_dir"
 install -m 0755 "$repo_dir/grok-bot-headless.mjs" "$lib_dir/grok-bot-headless.mjs"
 install -m 0755 "$repo_dir/bin/grok-bot-headless" "$bin_dir/grok-bot-headless"
 install -m 0644 "$repo_dir/grok-bot-headless.service" "$unit_dir/grok-bot-headless.service"
-escaped_app_bin="${app_bin//\\/\\\\}"
-escaped_app_bin="${escaped_app_bin//\"/\\\"}"
-escaped_daemon_script="${daemon_script//\\/\\\\}"
-escaped_daemon_script="${escaped_daemon_script//\"/\\\"}"
-printf 'GROK_BOT_BINARY="%s"\nGROK_BOT_DAEMON_SCRIPT="%s"\n' \
-  "$escaped_app_bin" "$escaped_daemon_script" > "$environment_path"
+escape_value() {
+  local value="${1//\\/\\\\}"
+  printf '%s' "${value//\"/\\\"}"
+}
+{
+  printf 'GROK_BOT_NODE="%s"\n' "$(escape_value "$node_bin")"
+  printf 'GROK_BOT_APP_ASAR="%s"\n' "$(escape_value "$app_asar")"
+  if [[ -n "$daemon_script" ]]; then
+    printf 'GROK_BOT_DAEMON_SCRIPT="%s"\n' "$(escape_value "$daemon_script")"
+  fi
+} > "$environment_path"
 chmod 0600 "$environment_path"
 systemctl --user daemon-reload
 systemctl --user enable grok-bot-headless.service

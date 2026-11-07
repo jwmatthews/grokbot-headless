@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -10,6 +10,7 @@ import {
   accountScope,
   base64url,
   cursorChecksum,
+  extractAsar,
   hasCredentialShape,
   isTestedClientVersion,
   jwtPayload,
@@ -118,6 +119,71 @@ test('machine policy rejects a backend permission ceiling', async () => {
     ),
     /backend limited the machine policy to ask/,
   );
+});
+
+// Builds an archive the same way @electron/asar does: a size pickle, an index pickle, then file data.
+function buildAsar(asarPath, files) {
+  const index = { files: {} };
+  const chunks = [];
+  let offset = 0;
+  for (const [archivePath, file] of Object.entries(files)) {
+    const segments = archivePath.split('/');
+    let directory = index;
+    for (const segment of segments.slice(0, -1)) {
+      directory = directory.files[segment] ??= { files: {} };
+    }
+    const content = Buffer.from(file.content);
+    const entry = { size: content.length };
+    if (file.executable) entry.executable = true;
+    if (file.unpacked) {
+      entry.unpacked = true;
+      const unpackedPath = join(`${asarPath}.unpacked`, archivePath);
+      mkdirSync(dirname(unpackedPath), { recursive: true });
+      writeFileSync(unpackedPath, content);
+    } else {
+      entry.offset = String(offset);
+      chunks.push(content);
+      offset += content.length;
+    }
+    directory.files[segments.at(-1)] = entry;
+  }
+  const json = Buffer.from(JSON.stringify(index));
+  const padded = Math.ceil(json.length / 4) * 4;
+  const header = Buffer.alloc(16 + padded);
+  header.writeUInt32LE(4, 0);
+  header.writeUInt32LE(8 + padded, 4);
+  header.writeUInt32LE(4 + padded, 8);
+  header.writeUInt32LE(json.length, 12);
+  json.copy(header, 16);
+  writeFileSync(asarPath, Buffer.concat([header, ...chunks]));
+}
+
+test('extractAsar copies selected archive paths, unpacked files, and executable bits', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'grok-bot-headless-asar-'));
+  try {
+    const asarPath = join(directory, 'app.asar');
+    buildAsar(asarPath, {
+      'package.json': { content: '{"version":"1.2.3"}' },
+      'dist/local-exec-daemon/main.cjs': { content: 'module.exports = "daemon";' },
+      'dist/local-exec-daemon/messages-worker.cjs': { content: 'worker', executable: true },
+      'dist/deps/tree-sitter/build/Release/binding.node': { content: 'native', unpacked: true },
+      'dist/renderer/index.html': { content: '<html>' },
+    });
+    const destination = join(directory, 'runtime');
+    await extractAsar(asarPath, destination, ['package.json', 'dist/local-exec-daemon', 'dist/deps']);
+    const read = (path) => readFileSync(join(destination, path), 'utf8');
+    assert.equal(read('package.json'), '{"version":"1.2.3"}');
+    assert.equal(read('dist/local-exec-daemon/main.cjs'), 'module.exports = "daemon";');
+    assert.equal(read('dist/local-exec-daemon/messages-worker.cjs'), 'worker');
+    assert.equal(read('dist/deps/tree-sitter/build/Release/binding.node'), 'native');
+    assert.equal(statSync(join(destination, 'dist/local-exec-daemon/messages-worker.cjs')).mode & 0o777, 0o755);
+    assert.equal(statSync(join(destination, 'dist/local-exec-daemon/main.cjs')).mode & 0o777, 0o644);
+    assert.throws(() => statSync(join(destination, 'dist/renderer')), /ENOENT/, 'unselected paths stay in the archive');
+    await assert.rejects(extractAsar(asarPath, destination, ['dist/missing']), /has no dist\/missing/);
+    await assert.rejects(extractAsar(join(destination, 'package.json'), destination, ['package.json']), /Not an asar archive/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('the CLI runs when its path contains a symlink', () => {

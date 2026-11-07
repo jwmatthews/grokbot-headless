@@ -2,7 +2,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync, fork } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { access, chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, copyFile, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir, hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -28,12 +28,14 @@ const DAEMON_CREDENTIAL_PATH = join(DATA_ROOT, 'local-exec-daemon-credential.jso
 const HEARTBEAT_PATH = join(DATA_ROOT, 'local-exec-supervisor.json');
 const DISCOVERY_PATH = join(DATA_ROOT, 'local-exec-daemon.json');
 const SETTINGS_PATH = join(DATA_ROOT, 'settings.json');
-const APP_BINARY = process.env.GROK_BOT_BINARY || '/opt/Grok Bot/grok-bot';
-const DAEMON_SCRIPT = process.env.GROK_BOT_DAEMON_SCRIPT || '/opt/Grok Bot/resources/app.asar/dist/local-exec-daemon/main.cjs';
-const DAEMON_CONTAINER_PATH = DAEMON_SCRIPT.includes('.asar/')
-  ? `${DAEMON_SCRIPT.slice(0, DAEMON_SCRIPT.indexOf('.asar/'))}.asar`
-  : DAEMON_SCRIPT;
-const PACKAGE_JSON_PATH = process.env.GROK_BOT_PACKAGE_JSON || join(dirname(APP_BINARY), 'resources', 'app.asar', 'package.json');
+const APP_ASAR = process.env.GROK_BOT_APP_ASAR || '/opt/Grok Bot/resources/app.asar';
+const DAEMON_SCRIPT_OVERRIDE = process.env.GROK_BOT_DAEMON_SCRIPT || null;
+const PACKAGE_JSON_OVERRIDE = process.env.GROK_BOT_PACKAGE_JSON || null;
+const RUNTIME_DIR = process.env.GROK_BOT_RUNTIME_DIR || join(homedir(), '.local', 'lib', 'grok-bot-headless', 'runtime');
+const RUNTIME_SOURCE_PATH = join(RUNTIME_DIR, '.source.json');
+// The daemon resolves its dependencies from ../deps, so both directories must stay siblings.
+const RUNTIME_ARCHIVE_PATHS = Object.freeze(['package.json', 'dist/local-exec-daemon', 'dist/deps']);
+const DAEMON_ARCHIVE_PATH = 'dist/local-exec-daemon/main.cjs';
 const TESTED_CLIENT_VERSIONS = Object.freeze(['0.30.0']);
 const POLICIES = Object.freeze(['always', 'ask', 'never']);
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
@@ -186,51 +188,171 @@ async function loadCredentials() {
 
 const heartbeat = () => atomicJson(HEARTBEAT_PATH, { pid: process.pid, at: Date.now() });
 
-// --- Official application ----------------------------------------------------
+// --- Application archive -----------------------------------------------------
+// Node cannot read files inside app.asar, and current Grok Bot builds disable the
+// Electron RunAsNode fuse. The controller therefore copies the daemon and its
+// dependencies out of the archive and runs them with the controller's own Node.
 
-function appNode(code) {
-  return execFileSync(APP_BINARY, ['-e', code], {
-    encoding: 'utf8',
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-    stdio: ['ignore', 'pipe', 'ignore'],
-    timeout: SUBPROCESS_TIMEOUT_MS,
-  });
+async function readAsarIndex(asarPath) {
+  const handle = await open(asarPath, 'r');
+  try {
+    // Layout: u32 pickle size (4), u32 index pickle size, u32 payload size, u32 JSON length, JSON (padded to 4).
+    const sizes = Buffer.alloc(16);
+    await handle.read(sizes, 0, 16, 0);
+    const indexPickleSize = sizes.readUInt32LE(4);
+    const jsonLength = sizes.readUInt32LE(12);
+    if (sizes.readUInt32LE(0) !== 4 || jsonLength === 0 || jsonLength > indexPickleSize) {
+      throw new Error(`Not an asar archive: ${asarPath}`);
+    }
+    const json = Buffer.alloc(jsonLength);
+    await handle.read(json, 0, jsonLength, 16);
+    return { index: JSON.parse(json.toString('utf8')), dataOffset: 8 + indexPickleSize };
+  } finally {
+    await handle.close();
+  }
 }
 
-let installedVersionCache;
-function installedVersion() {
-  if (installedVersionCache === undefined) {
-    try {
-      installedVersionCache = appNode(`process.stdout.write(require(${JSON.stringify(PACKAGE_JSON_PATH)}).version)`).trim() || null;
-    } catch {
-      installedVersionCache = null;
-    }
+function asarEntry(index, archivePath) {
+  let entry = index;
+  for (const segment of archivePath.split('/')) {
+    entry = entry?.files?.[segment];
+    if (!entry) throw new Error(`The application archive has no ${archivePath}`);
   }
-  return installedVersionCache;
+  return entry;
+}
+
+async function extractAsar(asarPath, destination, archivePaths) {
+  const { index, dataOffset } = await readAsarIndex(asarPath);
+  const handle = await open(asarPath, 'r');
+  const extractEntry = async (entry, archivePath) => {
+    const target = join(destination, archivePath);
+    if (entry.files) {
+      await mkdir(target, { recursive: true, mode: 0o755 });
+      for (const name of Object.keys(entry.files)) await extractEntry(entry.files[name], `${archivePath}/${name}`);
+      return;
+    }
+    if (entry.link !== undefined) throw new Error(`Symbolic links in the application archive are not supported: ${archivePath}`);
+    await mkdir(dirname(target), { recursive: true, mode: 0o755 });
+    if (entry.unpacked) {
+      await copyFile(join(`${asarPath}.unpacked`, archivePath), target);
+    } else {
+      const data = Buffer.alloc(entry.size);
+      await handle.read(data, 0, entry.size, dataOffset + Number(entry.offset));
+      await writeFile(target, data);
+    }
+    await chmod(target, entry.executable ? 0o755 : 0o644);
+  };
+  try {
+    for (const archivePath of archivePaths) await extractEntry(asarEntry(index, archivePath), archivePath);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readAsarJson(asarPath, archivePath) {
+  const { index, dataOffset } = await readAsarIndex(asarPath);
+  const entry = asarEntry(index, archivePath);
+  const handle = await open(asarPath, 'r');
+  try {
+    const data = Buffer.alloc(entry.size);
+    await handle.read(data, 0, entry.size, dataOffset + Number(entry.offset));
+    return JSON.parse(data.toString('utf8'));
+  } finally {
+    await handle.close();
+  }
+}
+
+async function archiveFingerprint() {
+  const info = await stat(APP_ASAR).catch((error) => {
+    throw new Error(`Cannot access the Grok Bot application archive: ${APP_ASAR}`, { cause: error });
+  });
+  return { asar: APP_ASAR, size: info.size, mtimeMs: info.mtimeMs };
+}
+
+async function ensureRuntime() {
+  const source = await archiveFingerprint();
+  const current = await readJson(RUNTIME_SOURCE_PATH).catch(() => null);
+  if (current && current.asar === source.asar && current.size === source.size && current.mtimeMs === source.mtimeMs) {
+    return;
+  }
+  const staging = `${RUNTIME_DIR}.${process.pid}.tmp`;
+  await rm(staging, { recursive: true, force: true });
+  try {
+    await extractAsar(APP_ASAR, staging, RUNTIME_ARCHIVE_PATHS);
+    await writeFile(join(staging, '.source.json'), formatJson({ ...source, extractedAtMs: Date.now() }));
+    await rm(RUNTIME_DIR, { recursive: true, force: true });
+    await mkdir(dirname(RUNTIME_DIR), { recursive: true, mode: 0o755 });
+    await rename(staging, RUNTIME_DIR);
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+}
+
+// --- Official daemon ---------------------------------------------------------
+
+let runtimeCache;
+async function loadRuntime() {
+  if (runtimeCache) return runtimeCache;
+  let daemonScript;
+  let packageJson;
+  if (DAEMON_SCRIPT_OVERRIDE) {
+    daemonScript = DAEMON_SCRIPT_OVERRIDE;
+    await access(daemonScript).catch((error) => {
+      throw new Error(`Cannot access the Grok Bot daemon script: ${daemonScript}`, { cause: error });
+    });
+    packageJson = PACKAGE_JSON_OVERRIDE ? await readJson(PACKAGE_JSON_OVERRIDE) : null;
+  } else {
+    await ensureRuntime();
+    daemonScript = join(RUNTIME_DIR, DAEMON_ARCHIVE_PATH);
+    packageJson = await readJson(PACKAGE_JSON_OVERRIDE || join(RUNTIME_DIR, 'package.json'));
+  }
+  const version = typeof packageJson?.version === 'string' && packageJson.version.length > 0 ? packageJson.version : null;
+  runtimeCache = { daemonScript, version };
+  return runtimeCache;
 }
 
 function clientVersion() {
-  return process.env.SAND_CLIENT_APP_VERSION || installedVersion() || TESTED_CLIENT_VERSIONS.at(-1);
+  return process.env.SAND_CLIENT_APP_VERSION || runtimeCache?.version || TESTED_CLIENT_VERSIONS.at(-1);
 }
 
-function probeDaemonEntry() {
-  appNode(`require.resolve(${JSON.stringify(DAEMON_SCRIPT)})`);
+async function installedVersion() {
+  if (process.env.SAND_CLIENT_APP_VERSION) return process.env.SAND_CLIENT_APP_VERSION;
+  if (DAEMON_SCRIPT_OVERRIDE) return (await loadRuntime()).version;
+  return (await readAsarJson(APP_ASAR, 'package.json')).version;
 }
 
-async function assertAppInstalled() {
-  for (const [label, path] of [['application binary', APP_BINARY], ['daemon archive', DAEMON_CONTAINER_PATH]]) {
-    await access(path).catch((error) => {
-      throw new Error(`Cannot access the Grok Bot ${label}: ${path}`, { cause: error });
+// Loads the daemon entry point and its native modules in a child Node, the same way `run` does.
+const DAEMON_PROBE = `
+const fs = require('node:fs');
+const path = require('node:path');
+const script = process.argv[1];
+require.resolve(script);
+const deps = path.join(path.dirname(script), '..', 'deps');
+if (fs.existsSync(deps)) {
+  process.env.NODE_PATH = deps;
+  require('node:module').Module._initPaths();
+  require('tree-sitter');
+  require('tree-sitter-bash');
+}
+`;
+
+function probeDaemonEntry(daemonScript) {
+  try {
+    execFileSync(process.execPath, ['-e', DAEMON_PROBE, daemonScript], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'ignore', 'pipe'],
+      timeout: SUBPROCESS_TIMEOUT_MS,
     });
+  } catch (error) {
+    const detail = String(error.stderr || '').trim().split('\n').filter(Boolean).pop() || error.message;
+    throw new Error(`The daemon entry point does not load in Node ${process.version}: ${detail}`);
   }
 }
 
-function spawnDaemon(machineId) {
-  const child = fork(DAEMON_SCRIPT, [], {
-    execPath: APP_BINARY,
+function spawnDaemon(daemonScript, machineId) {
+  const child = fork(daemonScript, [], {
     env: {
       ...process.env,
-      ELECTRON_RUN_AS_NODE: '1',
       SAND_PACKAGED: '1',
       SAND_DATA_ROOT: DATA_ROOT,
       SAND_CLIENT_APP_VERSION: clientVersion(),
@@ -405,15 +527,17 @@ async function login() {
 }
 
 async function localCompatibility() {
-  await assertAppInstalled();
-  probeDaemonEntry();
-  const version = installedVersion();
+  const runtime = await loadRuntime();
+  probeDaemonEntry(runtime.daemonScript);
+  const version = await installedVersion();
   if (!version) throw new Error('Cannot read the installed Grok Bot version');
   return {
     compatible: true,
     installedVersion: version,
     testedVersion: isTestedClientVersion(version),
     daemonEntryPoint: 'verified',
+    daemonScript: runtime.daemonScript,
+    nodeVersion: process.version,
   };
 }
 
@@ -424,7 +548,7 @@ async function check(localOnly) {
 }
 
 async function run() {
-  await assertAppInstalled();
+  const runtime = await loadRuntime();
   await mkdir(DATA_ROOT, { recursive: true, mode: 0o700 });
   const identity = await machineIdentity();
   let stopping = false;
@@ -433,7 +557,7 @@ async function run() {
   const renewCredentials = async () => mintDescriptor(identity, await loadCredentials());
 
   const startDaemon = () => {
-    const child = spawnDaemon(identity.machineId);
+    const child = spawnDaemon(runtime.daemonScript, identity.machineId);
     child.on('exit', (code, signal) => {
       if (stopping) return;
       console.error(`local-exec daemon exited (${signal || code}); restarting in ${DAEMON_RESTART_MS / 1000} seconds`);
@@ -489,6 +613,8 @@ async function policy(value) {
   if (!POLICIES.includes(value)) {
     throw new Error(`Policy must be one of: ${POLICIES.join(', ')}`);
   }
+  // The version header is informational here, so a missing application does not block the policy call.
+  await loadRuntime().catch(() => null);
   const identity = await machineIdentity();
   const credentials = await loadCredentials();
   await syncMachinePolicy(value, identity, credentials);
@@ -557,6 +683,7 @@ export {
   accountScope,
   base64url,
   cursorChecksum,
+  extractAsar,
   hasCredentialShape,
   isTestedClientVersion,
   jwtPayload,

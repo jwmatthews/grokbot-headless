@@ -18,7 +18,12 @@ process.on('message', (bootstrap) => {
   const { ELECTRON_RUN_AS_NODE, SAND_PACKAGED, SAND_DATA_ROOT, SAND_CLIENT_APP_VERSION } = process.env;
   fs.writeFileSync(
     path.join(process.env.SAND_DATA_ROOT, 'local-exec-daemon.json'),
-    JSON.stringify({ pid: process.pid, bootstrap, env: { ELECTRON_RUN_AS_NODE, SAND_PACKAGED, SAND_DATA_ROOT, SAND_CLIENT_APP_VERSION } }),
+    JSON.stringify({
+      pid: process.pid,
+      execPath: process.execPath,
+      bootstrap,
+      env: { ELECTRON_RUN_AS_NODE, SAND_PACKAGED, SAND_DATA_ROOT, SAND_CLIENT_APP_VERSION },
+    }),
   );
 });
 process.on('SIGTERM', () => process.exit(0));
@@ -105,7 +110,6 @@ test('the CLI drives the whole lifecycle against a fake backend and daemon', asy
     PATH: `${shimDir}:${process.env.PATH}`,
     GROK_BOT_HEADLESS_CONFIG_DIR: configDir,
     SAND_DATA_ROOT: dataRoot,
-    GROK_BOT_BINARY: process.execPath,
     GROK_BOT_DAEMON_SCRIPT: join(appDir, 'daemon.cjs'),
     GROK_BOT_PACKAGE_JSON: join(appDir, 'package.json'),
     CURSOR_API_BASE_URL: backend.url,
@@ -151,6 +155,8 @@ test('the CLI drives the whole lifecycle against a fake backend and daemon', asy
         installedVersion: '0.30.0',
         testedVersion: true,
         daemonEntryPoint: 'verified',
+        daemonScript: join(appDir, 'daemon.cjs'),
+        nodeVersion: process.version,
         authentication: 'verified',
       });
       const [refresh] = requestsTo('/oauth/token');
@@ -208,8 +214,9 @@ test('the CLI drives the whole lifecycle against a fake backend and daemon', asy
         const machine = readJson(paths.machine);
         const discovery = await waitFor(() => existsSync(paths.discovery) && readJson(paths.discovery), 'daemon bootstrap');
         assert.deepEqual(discovery.bootstrap, { type: 'sand-local-exec-file-key', key: null, computerId: machine.machineId });
+        assert.equal(discovery.execPath, process.execPath, 'the daemon runs in the controller Node');
+        assert.equal('ELECTRON_RUN_AS_NODE' in discovery.env, false, 'no Electron run-as-node flag');
         assert.deepEqual(discovery.env, {
-          ELECTRON_RUN_AS_NODE: '1',
           SAND_PACKAGED: '1',
           SAND_DATA_ROOT: dataRoot,
           SAND_CLIENT_APP_VERSION: '0.30.0',
