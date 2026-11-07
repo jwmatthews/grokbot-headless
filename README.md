@@ -39,7 +39,9 @@ The official Grok Bot desktop application normally performs these tasks:
 5. Send startup data through Node IPC.
 6. Renew credentials and restart the daemon when necessary.
 
-This project performs only those management tasks. It starts the official daemon with `ELECTRON_RUN_AS_NODE=1`, which does not create an Electron window or renderer.
+This project performs only those management tasks. It copies the official daemon script and its dependencies out of `app.asar` into `~/.local/lib/grok-bot-headless/runtime/` and starts the daemon with the system Node.js. No Electron window or renderer starts. The copy is refreshed when the installed archive changes.
+
+Grok Bot `0.79` and newer disable the Electron `RunAsNode` fuse, so the Electron binary can no longer run the daemon outside the desktop application. The daemon itself contains no Electron API calls. It needs only Node.js and two N-API native modules (`tree-sitter`, `tree-sitter-bash`).
 
 ```text
 Grok Bot service
@@ -214,6 +216,8 @@ Example:
   "installedVersion": "0.30.0",
   "testedVersion": true,
   "daemonEntryPoint": "verified",
+  "daemonScript": "/home/user/.local/lib/grok-bot-headless/runtime/dist/local-exec-daemon/main.cjs",
+  "nodeVersion": "v22.12.0",
   "authentication": "verified"
 }
 ```
@@ -292,9 +296,12 @@ The source remains in the directory where you ran `git clone`. This README uses 
 ```text
 ~/.local/bin/grok-bot-headless
 ~/.local/lib/grok-bot-headless/grok-bot-headless.mjs
+~/.local/lib/grok-bot-headless/runtime/
 ~/.config/systemd/user/grok-bot-headless.service
 ~/.config/grok-bot-headless/environment
 ```
+
+The `runtime/` directory holds the daemon files copied from the official `app.asar`. The controller creates it during `check --local` and `run`, and recreates it when the archive changes.
 
 ### Account configuration
 
@@ -337,15 +344,24 @@ Use GitHub private vulnerability reporting for security defects. See [SECURITY.m
 
 ## Custom paths
 
-If the official package uses different paths, pass them during installation:
+If the official package uses a different archive path, pass it during installation:
 
 ```bash
-GROK_BOT_BINARY=/path/to/grok-bot \
-GROK_BOT_DAEMON_SCRIPT=/path/to/local-exec-daemon/main.cjs \
+GROK_BOT_APP_ASAR=/path/to/resources/app.asar \
 ./install.sh
 ```
 
-The installer saves these paths in:
+If the daemon files already exist outside an archive, point the controller at the script instead. The `deps` directory must be a sibling of the script's parent directory, the same layout as inside `app.asar`:
+
+```bash
+GROK_BOT_DAEMON_SCRIPT=/path/to/dist/local-exec-daemon/main.cjs \
+GROK_BOT_PACKAGE_JSON=/path/to/package.json \
+./install.sh
+```
+
+The installer also records the absolute path of the Node.js binary as `GROK_BOT_NODE`. The systemd user manager has a short `PATH`, so a Node.js from nvm or another user directory would otherwise not be found. Run `./install.sh` again after you change the Node.js installation.
+
+The installer saves these values in:
 
 ```text
 ~/.config/grok-bot-headless/environment

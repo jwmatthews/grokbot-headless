@@ -1,4 +1,6 @@
 #!/usr/bin/env sh
 set -eu
 
-exec node "${HOME}/.local/lib/grok-bot-headless/grok-bot-headless.mjs" "$@"
+# GROK_BOT_NODE is written by install.sh so the systemd user manager, whose PATH
+# is limited to /usr/local/bin:/usr/bin, finds a Node installed elsewhere (for example nvm).
+exec "${GROK_BOT_NODE:-node}" "${HOME}/.local/lib/grok-bot-headless/grok-bot-headless.mjs" "$@"
